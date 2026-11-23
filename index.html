@@ -1,0 +1,408 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deriv Digit Predictor</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#080e1b;color:#edf2ff;font-family:Arial,sans-serif}
+header{padding:20px;background:#111c30;border-bottom:1px solid #263650}
+h1{font-size:22px;margin:0 0 6px}
+small,.muted{color:#93a4bd}
+main{max-width:1000px;margin:auto;padding:15px}
+.panel{background:#111c30;border:1px solid #293953;border-radius:12px;padding:15px;margin-bottom:14px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+button,select,input{padding:11px;border-radius:7px;border:1px solid #344966;background:#17263d;color:white}
+button{cursor:pointer;background:#087bda;border:0;font-weight:bold}
+button.stop{background:#b53c4a}
+input{width:100%;margin:8px 0}
+select{width:100%;margin:8px 0}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.stat{background:#17263d;padding:13px;border-radius:9px}
+.value{font-size:25px;font-weight:bold;margin-top:8px}
+.digits{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin-top:12px}
+.digit{background:#17263d;padding:10px 3px;border-radius:7px;text-align:center}
+.bar{height:5px;background:#33445d;margin-top:7px;border-radius:5px}
+.fill{height:5px;background:#10c997;border-radius:5px}
+.candidate{border:1px solid #0fbd91;padding:14px;border-radius:9px;margin-top:12px}
+.index{border-bottom:1px solid #293953;padding:13px 0}
+.index:last-child{border:0}
+.good{color:#10c997}
+.warning{color:#ffbd59}
+#status{color:#ffbd59}
+@media(min-width:650px){.stats{grid-template-columns:repeat(4,1fr)}}
+</style>
+</head>
+<body>
+<header>
+<h1>DERIV DIGIT PREDICTOR</h1>
+<small>Live Volatility Indices · Matches Analysis</small>
+<div id="status">● Disconnected</div>
+</header>
+
+<main>
+<section class="panel">
+<h3>Scanner settings</h3>
+<label>Deriv App ID</label>
+<input id="appid" value="1089">
+<label>Tick history</label>
+<select id="window">
+<option value="120">120 ticks</option>
+<option value="150">150 ticks</option>
+<option value="200" selected>200 ticks</option>
+</select>
+<div class="row">
+<button onclick="start()">START SCANNER</button>
+<button class="stop" onclick="stop()">STOP</button>
+</div>
+<p class="muted" id="message">Ready to connect to Deriv.</p>
+</section>
+
+<section class="stats">
+<div class="stat"><small>Indices discovered</small><div class="value" id="found">0</div></div>
+<div class="stat"><small>Live indices</small><div class="value" id="live">0</div></div>
+<div class="stat"><small>Ticks received</small><div class="value" id="ticks">0</div></div>
+<div class="stat"><small>Scanning window</small><div class="value" id="windowDisplay">200</div></div>
+</section>
+
+<section class="panel">
+<h3>Top Matches candidates</h3>
+<p class="muted">Highest historical digit frequencies across scanned indices.</p>
+<div id="top">Waiting for live data...</div>
+</section>
+
+<section class="panel">
+<div class="row">
+<h3>All Volatility Indices</h3>
+<small>Live analysis</small>
+</div>
+<div id="results">No market data loaded.</div>
+</section>
+
+<section class="panel">
+<h3>Important information</h3>
+<p class="muted">Predicted digits are ranked using historical frequency, not a guaranteed forecast. Every new tick can produce any digit. Test the scanner without risking money.</p>
+</section>
+</main>
+
+<script>
+let socket=null;
+let running=false;
+let markets={};
+let subscriptions={};
+let requestMap={};
+let requestId=0;
+let totalTicks=0;
+
+const $=id=>document.getElementById(id);
+
+function send(data){
+ if(socket && socket.readyState===WebSocket.OPEN){
+  socket.send(JSON.stringify(data));
+ }
+}
+
+function setStatus(text){
+ $('status').textContent=text;
+}
+
+function stop(){
+ running=false;
+ if(socket){
+  Object.values(subscriptions).forEach(id=>{
+   send({forget:id});
+  });
+  socket.close();
+ }
+ socket=null;
+ subscriptions={};
+ setStatus('● Disconnected');
+ $('message').textContent='Scanner stopped.';
+ $('live').textContent='0';
+}
+
+function start(){
+ stop();
+ markets={};
+ requestMap={};
+ totalTicks=0;
+ $('results').innerHTML='';
+ $('top').textContent='Loading markets...';
+ $('found').textContent='0';
+ $('live').textContent='0';
+ $('ticks').textContent='0';
+
+ const app=$('appid').value.trim();
+ if(!/^\d+$/.test(app)){
+  $('message').textContent='Enter a valid numeric App ID.';
+  return;
+ }
+
+ running=true;
+ setStatus('● Connecting');
+ $('message').textContent='Connecting to Deriv live feed...';
+
+ socket=new WebSocket(
+  'wss://ws.derivws.com/websockets/v3?app_id='+encodeURIComponent(app)
+ );
+
+ socket.onopen=()=>{
+  send({active_symbols:'brief'});
+ };
+
+ socket.onmessage=event=>{
+  const data=JSON.parse(event.data);
+
+  if(data.error){
+   $('message').textContent=data.error.message;
+   return;
+  }
+
+  if(data.msg_type==='active_symbols'){
+   discover(data.active_symbols||[]);
+  }
+
+  if(data.msg_type==='history'){
+   historyReceived(data);
+  }
+
+  if(data.msg_type==='tick'){
+   tickReceived(data);
+  }
+ };
+
+ socket.onerror=()=>{
+  setStatus('● Connection error');
+  $('message').textContent='Check your internet connection and App ID.';
+ };
+
+ socket.onclose=()=>{
+  running=false;
+  setStatus('● Disconnected');
+ };
+}
+
+function discover(symbols){
+ const found=symbols.filter(x=>{
+  const name=(x.display_name||'').toLowerCase();
+  return name.includes('volatility');
+ });
+
+ const unique=[...new Map(
+  found.map(x=>[x.symbol,x])
+ ).values()];
+
+ $('found').textContent=unique.length;
+
+ if(!unique.length){
+  $('message').textContent='No Volatility Indices found.';
+  return;
+ }
+
+ $('message').textContent='Loading '+unique.length+' indices...';
+
+ unique.forEach(x=>{
+  markets[x.symbol]={
+   name:x.display_name||x.symbol,
+   history:[],
+   quote:'—',
+   pip:2,
+   live:false,
+   loaded:false
+  };
+
+  const id=++requestId;
+  requestMap[id]=x.symbol;
+
+  send({
+   ticks_history:x.symbol,
+   count:Number($('window').value),
+   end:'latest',
+   style:'ticks',
+   req_id:id
+  });
+ });
+
+ render();
+}
+
+function getDigit(quote,pip){
+ const n=Number(quote);
+ if(!Number.isFinite(n))return null;
+
+ const str=n.toFixed(Math.min(10,Math.max(0,pip)));
+ return Number(str[str.length-1]);
+}
+
+function historyReceived(data){
+ const symbol=requestMap[data.req_id];
+ if(!symbol || !markets[symbol])return;
+
+ const market=markets[symbol];
+ const prices=data.history.prices||[];
+ const times=data.history.times||[];
+
+ market.pip=Number(data.pip_size??2);
+ market.history=prices.map((quote,i)=>({
+  digit:getDigit(quote,market.pip),
+  quote:String(quote),
+  time:times[i]||0
+ })).filter(x=>x.digit!==null);
+
+ market.quote=prices.length?String(prices[prices.length-1]):'—';
+ market.loaded=true;
+
+ const id=++requestId;
+ requestMap[id]=symbol;
+
+ send({
+  ticks:symbol,
+  subscribe:1,
+  req_id:id
+ });
+
+ render();
+}
+
+function tickReceived(data){
+ const tick=data.tick;
+ if(!tick)return;
+
+ const symbol=tick.symbol;
+ const market=markets[symbol];
+ if(!market)return;
+
+ if(data.subscription){
+  subscriptions[symbol]=data.subscription.id;
+ }
+
+ market.pip=Number(tick.pip_size??market.pip);
+
+ const digit=getDigit(tick.quote,market.pip);
+ if(digit===null)return;
+
+ market.history.push({
+  digit,
+  quote:String(tick.quote),
+  time:tick.epoch
+ });
+
+ const limit=Number($('window').value);
+ market.history=market.history.slice(-limit);
+ market.quote=String(tick.quote);
+ market.live=true;
+
+ totalTicks++;
+
+ render();
+}
+
+function analyze(market){
+ const counts=Array(10).fill(0);
+
+ market.history.forEach(x=>{
+  counts[x.digit]++;
+ });
+
+ const highest=Math.max(...counts);
+ const candidates=counts
+  .map((count,digit)=>({digit,count}))
+  .filter(x=>x.count===highest && highest>0);
+
+ return {counts,highest,candidates};
+}
+
+function render(){
+ const list=Object.entries(markets);
+ const live=list.filter(([s,m])=>m.live).length;
+
+ $('live').textContent=live;
+ $('ticks').textContent=totalTicks;
+ $('windowDisplay').textContent=$('window').value;
+
+ const ranked=list
+  .filter(([s,m])=>m.history.length)
+  .map(([symbol,m])=>({
+   symbol,
+   name:m.name,
+   ...analyze(m),
+   length:m.history.length
+  }))
+  .sort((a,b)=>
+   b.highest/b.length-a.highest/a.length
+  );
+
+ $('top').innerHTML=ranked.slice(0,5).map((x,i)=>`
+  <div class="index">
+   <b>${i+1}. ${escapeHTML(x.name)}</b>
+   <div class="good">
+    Suggested digit: ${x.candidates.map(c=>c.digit).join(' / ')}
+   </div>
+   <small>${x.highest}/${x.length} historical appearances ·
+   ${(x.highest/x.length*100).toFixed(1)}%</small>
+  </div>
+ `).join('')||'Waiting for ticks...';
+
+ $('results').innerHTML=list.map(([symbol,m])=>{
+  const a=analyze(m);
+  const n=m.history.length;
+
+  return `
+   <div class="index">
+    <div class="row">
+     <b>${escapeHTML(m.name)}</b>
+     <small class="${m.live?'good':'warning'}">
+      ${m.live?'● LIVE':'Loading'}
+     </small>
+    </div>
+
+    <div class="row">
+     <small>Latest quote: ${escapeHTML(m.quote)}</small>
+     <small>Last digit: ${n?m.history[n-1].digit:'—'}</small>
+    </div>
+
+    <div class="candidate">
+     <small>TOP MATCH CANDIDATE</small>
+     <div class="value">
+      ${a.candidates.length?
+       a.candidates.map(x=>x.digit).join(' / '):'—'}
+     </div>
+     <small>${n?
+      a.highest+' appearances in '+n+' ticks':'Waiting for data'}
+     </small>
+    </div>
+
+    <div class="digits">
+     ${a.counts.map((v,d)=>`
+      <div class="digit">
+       <b>${d}</b>
+       <div>${n?(v/n*100).toFixed(0):0}%</div>
+       <div class="bar">
+        <div class="fill" style="width:${n?v/n*100:0}%"></div>
+       </div>
+       <small>${v}</small>
+      </div>
+     `).join('')}
+    </div>
+   </div>
+  `;
+ }).join('');
+
+ $('message').textContent=
+  'Scanning '+live+' live indices. '+totalTicks+' ticks received.';
+}
+
+function escapeHTML(value){
+ return String(value).replace(/[&<>"']/g,c=>({
+  '&':'&amp;',
+  '<':'&lt;',
+  '>':'&gt;',
+  '"':'&quot;',
+  "'":'&#39;'
+ }[c]));
+}
+</script>
+</body>
+</html>
